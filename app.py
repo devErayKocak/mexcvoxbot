@@ -1,84 +1,105 @@
-import logging
 import os
-from telegram import Bot
-from telegram.ext import Application
-
 import asyncio
-import requests
+import logging
+import aiohttp
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
+from telegram import Bot
 
-# === Telegram Ayarları ===
+# === ENV ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# === Coin listeleri ===
-COINS_15M = ["FLOKI_USDT", "SUI_USDT", "ONDO_USDT", "APT_USDT", "STORJ_USDT",
-             "TAKE_USDT", "MOVE_USDT", "WLFI_USDT", "INJ_USDT", "WLD_USDT",
-             "HYPE_USDT", "BNB_USDT", "TIA_USDT", "PUMPFUN_USDT", "HOLO_USDT",
-             "ARB_USDT", "TONCOIN_USDT", "NEAR_USDT", "TAO_USDT", "ETHFI_USDT",
-             "SLF_USDT", "MRLN_USDT", "STREAMER_USDT"]
-COINS_1H = ["LTC_USDT", "XLM_USDT", "XRP_USDT", "APT_USDT", "TAO_USDT",
-            "ONDO_USDT", "DOT_USDT", "NEAR_USDT", "HYPE_USDT", "MANA_USDT",
-            "ARB_USDT", "INJ_USDT", "MOVE_USDT", "FLOKI_USDT"]
+# === SETTINGS ===
+SYMBOLS_15M = ["FLOKI_USDT", "SUI_USDT", "ONDO_USDT", "APT_USDT", "STORJ_USDT",
+               "TAKE_USDT", "MOVE_USDT", "WLFI_USDT", "INJ_USDT", "WLD_USDT",
+               "HYPE_USDT", "BNB_USDT", "TIA_USDT", "PUMPFUN_USDT", "HOLO_USDT",
+               "ARB_USDT", "TONCOIN_USDT", "NEAR_USDT", "TAO_USDT", "ETHFI_USDT",
+               "SLF_USDT", "MRLN_USDT", "STREAMER_USDT"]
 
-# === Logging ===
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+SYMBOLS_1H = ["LTC_USDT", "XLM_USDT", "XRP_USDT", "APT_USDT", "TAO_USDT",
+              "ONDO_USDT", "DOT_USDT", "NEAR_USDT", "HYPE_USDT", "MANA_USDT",
+              "ARB_USDT", "INJ_USDT", "MOVE_USDT", "FLOKI_USDT"]
 
-# === Basit strateji: sweep + wick + volume ===
-def check_signal(symbol, interval="15m"):
-    url = f"https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval={interval}&limit=50"
-    r = requests.get(url)
-    data = r.json().get("data", [])
-    if len(data) < 3:
+INTERVALS = {"15m": SYMBOLS_15M, "1h": SYMBOLS_1H}
+
+LOOKBACK = 500
+TP = 0.015   # %1.5
+SL = 0.02    # %2.0
+
+logging.basicConfig(level=logging.INFO)
+
+
+# === FETCH KLINE DATA FROM MEXC ===
+async def fetch_klines(session, symbol, interval, limit=LOOKBACK):
+    url = f"https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval={interval}&limit={limit}"
+    try:
+        async with session.get(url) as resp:
+            data = await resp.json()
+            if "data" not in data:
+                return pd.DataFrame()
+            df = pd.DataFrame(data["data"])
+            if df.empty:
+                return df
+            df.columns = ["time", "open", "close", "high", "low", "vol", "amount", "realOpen", "realClose", "realHigh", "realLow"]
+            df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+            df = df[["time", "open", "high", "low", "close", "vol"]].astype(float)
+            return df
+    except Exception as e:
+        logging.error(f"Fetch error {symbol}-{interval}: {e}")
+        return pd.DataFrame()
+
+
+# === STRATEGY ===
+def check_strategy(df):
+    if df.empty or len(df) < 20:
         return None
-    
-    df = pd.DataFrame(data)
-    df.columns = ["time","open","close","high","low","vol","amount","realOpen","realClose","realHigh","realLow"]
-    df["open"] = df["open"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["vol"] = df["vol"].astype(float)
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # sweep: önceki low kırıldı mı?
-    sweep = last["low"] < prev["low"]
+    # Sweep: son bar önceki dip/tepeyi kırmış mı?
+    sweep = last["low"] < df["low"].iloc[-5:-1].min() or last["high"] > df["high"].iloc[-5:-1].max()
 
-    # wick: fitil/gövde oranı
+    # Wick: fitil/gövde oranı
     body = abs(last["close"] - last["open"])
-    wick = (last["high"] - last["low"]) > body * 1.5
+    wick = (last["high"] - last["low"])
+    wick_ok = wick > 1.5 * body
 
-    # volume: ortalamanın üstünde mi?
-    vol_ok = last["vol"] > df["vol"].mean()
+    # Volume filter: son hacim ortalamanın üzerinde mi?
+    vol_ok = last["vol"] > df["vol"].rolling(20).mean().iloc[-1]
 
-    if sweep and wick and vol_ok:
-        return f"🟢 LONG sinyal | {symbol} | Fiyat: {last['close']}"
-    elif sweep and wick:
-        return f"🔴 SHORT sinyal | {symbol} | Fiyat: {last['close']}"
+    if sweep and wick_ok and vol_ok:
+        direction = "LONG" if last["close"] > prev["close"] else "SHORT"
+        return direction
     return None
 
-# === Ana Bot ===
+
+# === RUN BOT ===
 async def run_bot():
     bot = Bot(token=TELEGRAM_TOKEN)
 
-    while True:
-        for sym in COINS_15M:
-            signal = check_signal(sym, interval="Min15")
-            if signal:
-                await bot.send_message(chat_id=CHAT_ID, text=f"[15m] {signal}")
-                logging.info(f"15m sinyal gönderildi: {signal}")
+    async with aiohttp.ClientSession() as session:
+        while True:
+            logging.info("⏳ Yeni kontrol başlıyor...")
+            for interval, symbols in INTERVALS.items():
+                for sym in symbols:
+                    df = await fetch_klines(session, sym, interval)
+                    if df.empty:
+                        continue
+                    signal = check_strategy(df)
+                    if signal:
+                        price = df["close"].iloc[-1]
+                        msg = f"🟢 SİNYAL | {sym} | {interval}\n➡️ {signal}\n💰 Fiyat: {price:.4f}\n🎯 TP: {TP*100:.1f}% | 🛑 SL: {SL*100:.1f}%"
+                        try:
+                            await bot.send_message(chat_id=CHAT_ID, text=msg)
+                            logging.info(f"Sent: {msg}")
+                        except Exception as e:
+                            logging.error(f"Telegram send error: {e}")
 
-        for sym in COINS_1H:
-            signal = check_signal(sym, interval="Min60")
-            if signal:
-                await bot.send_message(chat_id=CHAT_ID, text=f"[1h] {signal}")
-                logging.info(f"1h sinyal gönderildi: {signal}")
+            logging.info("✅ Kontrol tamamlandı, 60sn bekleniyor...")
+            await asyncio.sleep(60)
 
-        logging.info("✅ Yeni kontrol tamamlandı.")
-        await asyncio.sleep(60)  # 1 dk bekle
 
 if __name__ == "__main__":
     asyncio.run(run_bot())
