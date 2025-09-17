@@ -1,4 +1,5 @@
 import logging
+import os
 from telegram import Bot
 from telegram.ext import Application
 
@@ -8,8 +9,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # === Telegram Ayarları ===
-TELEGRAM_TOKEN = "7811297577:AAFDDdcbV7KwDejK04M25ggxYNUqTEEmBvM"
-CHAT_ID = "1519003075"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 # === Coin listeleri ===
 COINS_15M = ["FLOKI_USDT", "SUI_USDT", "ONDO_USDT", "APT_USDT", "STORJ_USDT",
