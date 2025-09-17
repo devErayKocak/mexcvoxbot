@@ -29,6 +29,9 @@ SL = 0.02    # %2.0
 
 logging.basicConfig(level=logging.INFO)
 
+# === Hafızada aktif sinyal listesi ===
+active_signals = {}  # { "SYMBOL_INTERVAL": "LONG/SHORT" }
+
 
 # === FETCH KLINE DATA FROM MEXC ===
 async def fetch_klines(session, symbol, interval, limit=LOOKBACK):
@@ -71,7 +74,7 @@ def check_strategy(df):
 
     if sweep and wick_ok and vol_ok:
         direction = "LONG" if last["close"] > prev["close"] else "SHORT"
-        return direction
+        return direction, last["close"]
     return None
 
 
@@ -87,15 +90,21 @@ async def run_bot():
                     df = await fetch_klines(session, sym, interval)
                     if df.empty:
                         continue
-                    signal = check_strategy(df)
-                    if signal:
-                        price = df["close"].iloc[-1]
-                        msg = f"🟢 SİNYAL | {sym} | {interval}\n➡️ {signal}\n💰 Fiyat: {price:.4f}\n🎯 TP: {TP*100:.1f}% | 🛑 SL: {SL*100:.1f}%"
-                        try:
-                            await bot.send_message(chat_id=CHAT_ID, text=msg)
-                            logging.info(f"Sent: {msg}")
-                        except Exception as e:
-                            logging.error(f"Telegram send error: {e}")
+                    result = check_strategy(df)
+                    if result:
+                        direction, price = result
+                        key = f"{sym}_{interval}"
+
+                        # Eğer yeni sinyal, aktif sinyalden farklıysa gönder
+                        if key not in active_signals or active_signals[key] != direction:
+                            active_signals[key] = direction  # aktif sinyali güncelle
+
+                            msg = f"[{interval}] {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'} sinyal | {sym} | Fiyat: {price:.4f}\n🎯 TP: {TP*100:.1f}% | 🛑 SL: {SL*100:.1f}%"
+                            try:
+                                await bot.send_message(chat_id=CHAT_ID, text=msg)
+                                logging.info(f"Sent: {msg}")
+                            except Exception as e:
+                                logging.error(f"Telegram send error: {e}")
 
             logging.info("✅ Kontrol tamamlandı, 60sn bekleniyor...")
             await asyncio.sleep(60)
