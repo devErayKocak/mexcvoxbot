@@ -3,7 +3,6 @@ import asyncio
 import logging
 import aiohttp
 import pandas as pd
-from datetime import datetime, timezone
 from telegram import Bot
 
 # === ENV ===
@@ -29,8 +28,8 @@ SL = 0.02    # %2.0
 
 logging.basicConfig(level=logging.INFO)
 
-# === Hafızada aktif sinyal listesi ===
-active_signals = {}  # { "SYMBOL_INTERVAL": "LONG/SHORT" }
+# === Son gönderilen sinyaller (coin+tf+bar_time) ===
+last_signals = {}
 
 
 # === FETCH KLINE DATA FROM MEXC ===
@@ -61,20 +60,20 @@ def check_strategy(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Sweep: son bar önceki dip/tepeyi kırmış mı?
+    # Sweep
     sweep = last["low"] < df["low"].iloc[-5:-1].min() or last["high"] > df["high"].iloc[-5:-1].max()
-
-    # Wick: fitil/gövde oranı
+    # Wick
     body = abs(last["close"] - last["open"])
     wick = (last["high"] - last["low"])
     wick_ok = wick > 1.5 * body
-
-    # Volume filter: son hacim ortalamanın üzerinde mi?
+    # Volume
     vol_ok = last["vol"] > df["vol"].rolling(20).mean().iloc[-1]
+
+    logging.info(f"Check {df.iloc[-1]['time']} | sweep={sweep}, wick_ok={wick_ok}, vol_ok={vol_ok}")
 
     if sweep and wick_ok and vol_ok:
         direction = "LONG" if last["close"] > prev["close"] else "SHORT"
-        return direction, last["close"]
+        return direction, last["time"], last["close"]
     return None
 
 
@@ -92,21 +91,25 @@ async def run_bot():
                         continue
                     result = check_strategy(df)
                     if result:
-                        direction, price = result
+                        direction, bar_time, price = result
                         key = f"{sym}_{interval}"
 
-                        # Eğer yeni sinyal, aktif sinyalden farklıysa gönder
-                        if key not in active_signals or active_signals[key] != direction:
-                            active_signals[key] = direction  # aktif sinyali güncelle
+                        # Aynı bar için tekrar sinyal göndermeyi engelle
+                        if key in last_signals and last_signals[key]["bar_time"] == bar_time:
+                            logging.info(f"⏩ Skip (aynı bar) {sym} {interval} {direction}")
+                            continue
 
-                            msg = f"[{interval}] {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'} sinyal | {sym} | Fiyat: {price:.4f}\n🎯 TP: {TP*100:.1f}% | 🛑 SL: {SL*100:.1f}%"
-                            try:
-                                await bot.send_message(chat_id=CHAT_ID, text=msg)
-                                logging.info(f"Sent: {msg}")
-                            except Exception as e:
-                                logging.error(f"Telegram send error: {e}")
+                        # Yeni sinyal → kaydet & gönder
+                        last_signals[key] = {"direction": direction, "bar_time": bar_time}
 
-            logging.info("✅ Kontrol tamamlandı, 60sn bekleniyor...")
+                        msg = f"[{interval}] {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'} sinyal | {sym}\n💰 Fiyat: {price:.4f}\n🎯 TP: {TP*100:.1f}% | 🛑 SL: {SL*100:.1f}%"
+                        try:
+                            await bot.send_message(chat_id=CHAT_ID, text=msg)
+                            logging.info(f"✅ Sent: {sym} {interval} {direction} @ {bar_time}")
+                        except Exception as e:
+                            logging.error(f"Telegram send error: {e}")
+
+            logging.info("✅ Kontrol tamamlandı, 60sn bekleniyor...\n")
             await asyncio.sleep(60)
 
 
