@@ -1,118 +1,115 @@
+import os
+import time
+import logging
 import requests
 import pandas as pd
-import numpy as np
-from datetime import datetime
-from flask import Flask
-import time
-import threading
-
-app = Flask(__name__)
+from datetime import datetime, timezone
+from telegram import Bot
 
 # === Telegram Ayarları ===
-TELEGRAM_TOKEN = "7811297577:AAFDDdcbV7KwDejK04M25ggxYNUqTEEmBvM"
-CHAT_ID = "1519003075"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "7811297577:AAFDDdcbV7KwDejK04M25ggxYNUqTEEmBvM")
+CHAT_ID = os.getenv("CHAT_ID", "1519003075")
+bot = Bot(token=TELEGRAM_TOKEN)
 
-def send_signal(symbol, tf, direction, tp, sl):
-    emoji = "🟢" if direction=="LONG" else "🔴"
-    message = f"""{emoji} {direction} | {symbol} | {tf}
-🎯 TP: {tp*100:.1f}% | 🛑 SL: {sl*100:.1f}%
-⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    r = requests.post(url, data={"chat_id": CHAT_ID, "text": message})
-    print(f"[TELEGRAM] {symbol} {tf} {direction} → {r.status_code}")
+# === Logger ===
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# === Strateji Parametreleri ===
-TP_PCT = 0.015
-SL_PCT = 0.02
-L = 20
-wickMult = 1.2
-vol_window = 20
-volMult = 1.5
+# === Parametreler ===
+TP_PCT = 0.015  # %1.5
+SL_PCT = 0.02   # %2
+VOL_WINDOW = 20
+WICK_MULT = 1.2
+LOOKBACK = 30
 
+# === Coin listeleri ===
 COINS_15M = [
-    "FLOKI_USDT","SUI_USDT","ONDO_USDT","APT_USDT","STORJ_USDT",
-    "TAKE_USDT","MOVE_USDT","WLFI_USDT","INJ_USDT","WLD_USDT",
-    "HYPE_USDT","BNB_USDT","TIA_USDT","PUMPFUN_USDT","HOLO_USDT",
-    "ARB_USDT","TONCOIN_USDT","NEAR_USDT","TAO_USDT","ETHFI_USDT",
-    "SLF_USDT","MRLN_USDT","STREAMER_USDT"
+    "FLOKI_USDT","SUI_USDT","ONDO_USDT","APT_USDT","STORJ_USDT","TAKE_USDT","MOVE_USDT",
+    "WLFI_USDT","INJ_USDT","WLD_USDT","HYPE_USDT","BNB_USDT","TIA_USDT","PUMPFUN_USDT",
+    "HOLO_USDT","ARB_USDT","TONCOIN_USDT","NEAR_USDT","TAO_USDT","ETHFI_USDT","SLF_USDT",
+    "MRLN_USDT","STREAMER_USDT"
 ]
 
 COINS_1H = [
-    "LTC_USDT","XLM_USDT","DOT_USDT","XRP_USDT","APT_USDT",
-    "TAO_USDT","ONDO_USDT","FLOKI_USDT","NEAR_USDT","HYPE_USDT",
-    "MANA_USDT","ARB_USDT","INJ_USDT","MOVE_USDT"
+    "LTC_USDT","XLM_USDT","XRP_USDT","APT_USDT","TAO_USDT","ONDO_USDT","DOT_USDT",
+    "NEAR_USDT","HYPE_USDT","MANA_USDT","ARB_USDT","INJ_USDT","MOVE_USDT","FLOKI_USDT"
 ]
 
-# === Data Fetch ===
-def fetch_klines(symbol, interval="Min15", limit=200):
+# === MEXC Kline verisi çek ===
+def fetch_klines(symbol, interval="15m", limit=500):
     url = f"https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval={interval}&limit={limit}"
     r = requests.get(url)
     data = r.json()
-    if "data" not in data or not data["data"]:
+    if "data" not in data or len(data["data"]) == 0:
         return pd.DataFrame()
     df = pd.DataFrame(data["data"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    return df.rename(columns={"open":"open","high":"high","low":"low","close":"close","vol":"vol"})
+    df["open_time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+    df["close"] = df["close"].astype(float)
+    df["vol"] = df["amount"].astype(float)
+    return df[["open_time","open","high","low","close","vol"]]
 
-# === Strategy ===
-def run_strategy(df, L=20, wickMult=1.2, vol_window=20, volMult=1.5):
-    if len(df) < L+2:
+# === Strateji ===
+def run_strategy(df, sym):
+    if df.empty or len(df) < LOOKBACK:
         return None
-    body   = (df["close"] - df["open"]).abs()
-    lowerW = np.minimum(df["open"], df["close"]) - df["low"]
-    upperW = df["high"] - np.maximum(df["open"], df["close"])
-    prevLow  = df["low"].shift(1).rolling(L).min()
-    prevHigh = df["high"].shift(1).rolling(L).max()
-    sweepDn  = (df["low"] < prevLow) & (df["close"] > prevLow)
-    sweepUp  = (df["high"] > prevHigh) & (df["close"] < prevHigh)
-    wickOK_L = lowerW > body * wickMult
-    wickOK_S = upperW > body * wickMult
-    volOK = df["vol"] > df["vol"].rolling(vol_window).mean() * volMult
-    longCond  = sweepDn & wickOK_L & volOK
-    shortCond = sweepUp & wickOK_S & volOK
-    if longCond.iloc[-1]:
-        return ("LONG", df["time"].iloc[-1])
-    elif shortCond.iloc[-1]:
-        return ("SHORT", df["time"].iloc[-1])
+
+    last = df.iloc[-1]
+    body = abs(last["close"] - last["open"])
+    lower_wick = min(last["open"], last["close"]) - last["low"]
+    upper_wick = last["high"] - max(last["open"], last["close"])
+
+    prev_low = df["low"].iloc[-LOOKBACK:-1].min()
+    prev_high = df["high"].iloc[-LOOKBACK:-1].max()
+
+    sweep_down = last["low"] < prev_low and last["close"] > prev_low
+    sweep_up = last["high"] > prev_high and last["close"] < prev_high
+    wick_ok_long = lower_wick > body * WICK_MULT
+    wick_ok_short = upper_wick > body * WICK_MULT
+    vol_ok = last["vol"] > df["vol"].iloc[-VOL_WINDOW:].mean()
+
+    long_signal = sweep_down and wick_ok_long and vol_ok
+    short_signal = sweep_up and wick_ok_short and vol_ok
+
+    if long_signal:
+        sl = last["low"] * (1 - SL_PCT)
+        tp = last["close"] * (1 + TP_PCT)
+        return f"🟢 LONG | {sym}\nFiyat: {last['close']:.4f}\nTP: {tp:.4f} | SL: {sl:.4f}"
+    elif short_signal:
+        sl = last["high"] * (1 + SL_PCT)
+        tp = last["close"] * (1 - TP_PCT)
+        return f"🔴 SHORT | {sym}\nFiyat: {last['close']:.4f}\nTP: {tp:.4f} | SL: {sl:.4f}"
     return None
 
-# === Bot Loop ===
-def bot_loop():
-    print("🚀 Bot Railway üzerinde çalışıyor...")
+# === Bot döngüsü ===
+def run_bot():
     while True:
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Kontrol başlıyor...")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(f"Yeni kontrol başladı: {now}")
 
         for sym in COINS_15M:
-            df = fetch_klines(sym, "Min15", 200)
-            if df.empty:
-                continue
-            sig = run_strategy(df)
-            if sig:
-                direction, t = sig
-                send_signal(sym, "15m", direction, TP_PCT, SL_PCT)
-                print(f"[{sym} 15m] Sinyal: {direction} @ {t}")
+            try:
+                df = fetch_klines(sym, "15m", 200)
+                msg = run_strategy(df, sym)
+                if msg:
+                    bot.send_message(chat_id=CHAT_ID, text=f"[15m] {msg}")
+                    logging.info(f"Sinyal gönderildi: {sym} (15m)")
+            except Exception as e:
+                logging.error(f"{sym} hata: {e}")
 
         for sym in COINS_1H:
-            df = fetch_klines(sym, "Min60", 200)
-            if df.empty:
-                continue
-            sig = run_strategy(df)
-            if sig:
-                direction, t = sig
-                send_signal(sym, "1h", direction, TP_PCT, SL_PCT)
-                print(f"[{sym} 1h] Sinyal: {direction} @ {t}")
+            try:
+                df = fetch_klines(sym, "1h", 200)
+                msg = run_strategy(df, sym)
+                if msg:
+                    bot.send_message(chat_id=CHAT_ID, text=f"[1h] {msg}")
+                    logging.info(f"Sinyal gönderildi: {sym} (1h)")
+            except Exception as e:
+                logging.error(f"{sym} hata: {e}")
 
-        print(f"[{now}] Kontrol bitti.\n")
-        time.sleep(60*15)
-
-# === Railway endpoint ===
-@app.route("/")
-def home():
-    return "Telegram sinyal botu Railway üzerinde çalışıyor ✅"
-
-# Thread ile sürekli botu çalıştır
-threading.Thread(target=bot_loop, daemon=True).start()
+        logging.info("Kontrol bitti, 5 dk bekleniyor...\n")
+        time.sleep(300)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    run_bot()
